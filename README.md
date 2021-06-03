@@ -1,5 +1,7 @@
 # File Transfer over Clipboard (ftoc)
 是个通过剪贴板来传输文件的小工具，例如在VMWare Horizon的客户机和宿主机之间实现文件传输
+
+**当前仅支持 Windows**
 ## 使用
 
 接收方先开启ftoc：
