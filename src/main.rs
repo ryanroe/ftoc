@@ -38,6 +38,9 @@ struct AppSendSetting {
 struct AppRecvSetting {
     timeout: u64,
 }
+
+const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+
 fn parse_args(a: Args) -> Result<AppSetting, String> {
     let mut state = ArgState::Default;
     let mut send_timeout = 2000;
@@ -131,6 +134,7 @@ fn parse_args(a: Args) -> Result<AppSetting, String> {
     }
 }
 fn main() -> Result<(), String> {
+    println!("ftoc ({})", VERSION);
     parse_args(std::env::args()).and_then(|x| {
         if x.dry_run {
             dbg!(x);
@@ -159,6 +163,8 @@ fn recv_file(s: &AppRecvSetting) -> Result<(), io::Error> {
     let mut last_index = 0;
     let mut has_started = false;
     let mut time_wait_ms = 0;
+    let mut total_len = 0u64;
+    let mut recved_len = 0u64;
     println!("waiting for file");
     loop {
         match state {
@@ -175,6 +181,7 @@ fn recv_file(s: &AppRecvSetting) -> Result<(), io::Error> {
                                 println!("start recv file: {}", x[1]);
                                 writer = Some(BufWriter::new(f));
                                 state = RecvState::Start;
+                                total_len = x[2].parse().expect("can't read total length of file");
                             }
                             Err(e) => {
                                 dbg!(e);
@@ -193,12 +200,11 @@ fn recv_file(s: &AppRecvSetting) -> Result<(), io::Error> {
                 if let Ok(x) = get_clipboard_string() {
                     if x.starts_with("ftoc-end") {
                         state = RecvState::End;
+                    } else if x.starts_with("ftoc-start") {
+                        sleep_ms(100);
+                        continue;
                     } else if x.starts_with("ftoc") {
                         let x: Vec<&str> = x.split(":").collect();
-                        if x.len() < 3 {
-                            sleep_ms(100);
-                            continue;
-                        }
                         let idx: i32 = x[1].parse().expect("invalid index");
 
                         if last_index == idx - 1 {
@@ -206,7 +212,10 @@ fn recv_file(s: &AppRecvSetting) -> Result<(), io::Error> {
                                 if let Some(x) = &mut writer {
                                     time_wait_ms = 0;
                                     last_index = idx;
-                                    println!("recv block {}", idx);
+                                    recved_len += v.len() as u64;
+
+                                    let percentage: f32 = (recved_len as f32) / (total_len as f32);
+                                    println!("recv block {} ({:.2}%)", idx, percentage * 100f32);
                                     let _ = x.write(v.as_ref());
                                 } else {
                                     println!("warn: block {} write failed", idx)
@@ -251,16 +260,19 @@ fn send_file(s: &AppSendSetting) -> Result<(), io::Error> {
     if s.skip != 0 {
         println!("(resume mode)");
     }
-    p.file_name()
-        .and_then(|x| x.to_str())
-        .and_then(|x| {
-            println!("sending file : {}", x);
-            Some(format!("ftoc-start:{}", x))
-        })
-        .and_then(|x| {
-            let _ = set_clipboard_string(x.as_str());
-            Some(())
-        });
+    let filename = p
+        .file_name()
+        .expect("can't read file name")
+        .to_str()
+        .expect("can't convert file name");
+    reader.seek(io::SeekFrom::End(0))?;
+    let len = reader.stream_position()?;
+    reader.seek(io::SeekFrom::Start(0))?;
+    let x = format!("ftoc-start:{}:{}", filename, len);
+    println!("sending file : {} with {} bytes long", filename, len);
+
+    let _ = set_clipboard_string(x.as_str());
+
     sleep_ms(2000);
 
     let mut v = vec![0u8; s.size];
