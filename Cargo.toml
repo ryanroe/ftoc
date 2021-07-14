@@ -1,6 +1,6 @@
 [package]
 name = "ftoc"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Ryan <smbserv@qq.com>"]
 edition = "2018"
 
@@ -8,4 +8,4 @@ edition = "2018"
 
 [dependencies]
 clipboard-win="*"
-base64="*"
+ascii85="*"

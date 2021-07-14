@@ -1,5 +1,5 @@
-use base64::{decode_config, encode_config};
-use clipboard_win::{get_clipboard_string, set_clipboard_string};
+mod protocol;
+use protocol::{Packet, PacketData, PacketStart, Protocol};
 use std::{
     env::Args,
     fs::File,
@@ -53,16 +53,16 @@ fn parse_args(a: Args) -> Result<AppSetting, String> {
 
     for x in a {
         match x.as_str() {
-            "--size" => {
+            "--size" | "-s" => {
                 state = ArgState::Size;
             }
-            "--skip" => {
+            "--skip" | "-S" => {
                 state = ArgState::Skip;
             }
-            "--send-timeout" => {
+            "--send-timeout" | "-st" => {
                 state = ArgState::SendTimeout;
             }
-            "--recv-timeout" => {
+            "--recv-timeout" | "-rt" => {
                 state = ArgState::RecvTimeout;
             }
             "--dry-run" => {
@@ -148,103 +148,91 @@ fn main() -> Result<(), String> {
         }
     })
 }
-enum RecvState {
-    Wait,
-    Start,
-    End,
-}
+
 fn sleep_ms(ms: u64) {
     std::thread::sleep(std::time::Duration::from_millis(ms))
 }
 fn recv_file(s: &AppRecvSetting) -> Result<(), io::Error> {
-    let _ = set_clipboard_string("---")?;
     let mut writer: Option<BufWriter<File>> = None;
-    let mut state = RecvState::Wait;
     let mut last_index = 0;
     let mut has_started = false;
     let mut time_wait_ms = 0;
+    let mut timeout_ms = s.timeout;
     let mut total_len = 0u64;
     let mut recved_len = 0u64;
+    let protocol = Protocol::new();
     println!("waiting for file");
     loop {
-        match state {
-            RecvState::Wait => {
-                if let Ok(x) = get_clipboard_string() {
-                    if x.starts_with("ftoc-start") {
-                        if has_started {
-                            continue;
-                        }
-                        has_started = true;
-                        let x: Vec<&str> = x.split(":").collect();
-                        match File::create(Path::new(x[1])) {
-                            Ok(f) => {
-                                println!("start recv file: {}", x[1]);
-                                writer = Some(BufWriter::new(f));
-                                state = RecvState::Start;
-                                total_len = x[2].parse().expect("can't read total length of file");
-                            }
-                            Err(e) => {
-                                dbg!(e);
-                                break;
-                            }
-                        }
-                    } else {
-                        sleep_ms(1000);
-                    }
-                } else {
-                    sleep_ms(100);
-                    continue;
+        if let Ok(x) = protocol.recv_decoded() {
+            match x {
+                Packet::Noop => {
+                    sleep_ms(1000);
                 }
-            }
-            RecvState::Start => {
-                if let Ok(x) = get_clipboard_string() {
-                    if x.starts_with("ftoc-end") {
-                        state = RecvState::End;
-                    } else if x.starts_with("ftoc-start") {
-                        sleep_ms(100);
+                Packet::Start(x) => {
+                    if has_started {
                         continue;
-                    } else if x.starts_with("ftoc") {
-                        let x: Vec<&str> = x.split(":").collect();
-                        let idx: i32 = x[1].parse().expect("invalid index");
+                    }
+                    has_started = true;
 
-                        if last_index == idx - 1 {
-                            if let Ok(v) = decode_config(x[2], base64::URL_SAFE_NO_PAD) {
-                                if let Some(x) = &mut writer {
-                                    time_wait_ms = 0;
-                                    last_index = idx;
-                                    recved_len += v.len() as u64;
+                    match File::create(Path::new(&x.name)) {
+                        Ok(f) => {
+                            println!("start recv file: {}", x.name);
+                            writer = Some(BufWriter::new(f));
+                            total_len = x.length;
+                            timeout_ms = (x.timeout - 150) as u64;
+                            println!("reset timeout from sender side to {} ms", timeout_ms);
+                        }
+                        Err(e) => {
+                            dbg!(e);
+                            break;
+                        }
+                    }
+                }
+                Packet::Data(x) => {
+                    if !has_started {
+                        continue;
+                    }
+                    let idx = x.index;
 
-                                    let percentage: f32 = (recved_len as f32) / (total_len as f32);
-                                    println!("recv block {} ({:.2}%)", idx, percentage * 100f32);
-                                    let _ = x.write(v.as_ref());
-                                } else {
-                                    println!("warn: block {} write failed", idx)
-                                }
-                            } else {
-                                println!("warn: block {} decode failed", idx)
+                    if last_index == idx - 1 {
+                        if let Some(w) = &mut writer {
+                            time_wait_ms = 0;
+                            last_index = idx;
+                            recved_len += x.data.len() as u64;
+
+                            let percentage: f32 = (recved_len as f32) / (total_len as f32);
+                            println!("recv block {} ({:.2}%)", idx, percentage * 100f32);
+                            if let Err(_) = w.write(x.data.as_ref()) {
+                                println!("warning: can't write to destination file");
                             }
                         } else {
-                            // wait for missed block or retransmission
-                            time_wait_ms += s.timeout;
-                            if time_wait_ms > 10000 {
-                                println!("warning: recv staled, last_index={}", last_index);
-                                time_wait_ms = 0;
-                            }
+                            println!("warning: block {} write failed", idx)
+                        }
+                    } else {
+                        // wait for missed block or retransmission
+                        time_wait_ms += s.timeout;
+                        if time_wait_ms > 10000 {
+                            println!("warning: recv staled, last_index={}", last_index);
+                            time_wait_ms = 0;
                         }
                     }
-                    sleep_ms(s.timeout);
-                } else {
-                    sleep_ms(100);
-                    continue;
+                    sleep_ms(timeout_ms);
+                }
+                Packet::End => {
+                    if recved_len != total_len {
+                        println!("[warn] recved end but data is incomplete");
+                        continue;
+                    }
+                    if let Some(x) = &mut writer {
+                        let _ = x.flush();
+                        println!("file saved");
+                        break;
+                    }
                 }
             }
-            RecvState::End => {
-                if let Some(x) = &mut writer {
-                    let _ = x.flush();
-                    println!("file saved")
-                }
-                break;
-            }
+        } else {
+            sleep_ms(100);
+            continue;
         }
     }
     Ok(())
@@ -253,6 +241,7 @@ fn send_file(s: &AppSendSetting) -> Result<(), io::Error> {
     let p = Path::new(&s.file_path);
     let file = File::open(p)?;
     let mut reader = BufReader::new(file);
+    let protocol = Protocol::new();
 
     let mut eof = false;
 
@@ -268,10 +257,12 @@ fn send_file(s: &AppSendSetting) -> Result<(), io::Error> {
     reader.seek(io::SeekFrom::End(0))?;
     let len = reader.stream_position()?;
     reader.seek(io::SeekFrom::Start(0))?;
-    let x = format!("ftoc-start:{}:{}", filename, len);
     println!("sending file : {} with {} bytes long", filename, len);
-
-    let _ = set_clipboard_string(x.as_str());
+    let _ = protocol.send_encoded(Packet::Start(PacketStart {
+        timeout: s.timeout as u32,
+        name: filename.to_owned(),
+        length: len,
+    }));
 
     sleep_ms(2000);
 
@@ -288,14 +279,16 @@ fn send_file(s: &AppSendSetting) -> Result<(), io::Error> {
                 eof = true;
             } else {
                 index += 1;
-                let s = encode_config(&v[0..s], base64::URL_SAFE_NO_PAD);
-                let text = format!("ftoc:{}:{}", index, s);
-                let _ = set_clipboard_string(text.as_str());
+                let packet = Packet::Data(PacketData {
+                    index: index,
+                    data: v[0..s].to_vec(),
+                });
+                let _ = protocol.send_encoded(packet);
                 println!("sending block {}", index);
             }
         });
         if eof {
-            let _ = set_clipboard_string("ftoc-end")?;
+            let _ = protocol.send_encoded(Packet::End);
             println!("file sent");
             break;
         }
